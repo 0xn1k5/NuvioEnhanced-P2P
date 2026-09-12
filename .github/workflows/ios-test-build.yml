@@ -11,17 +11,27 @@ on:
           - Debug
           - Release
         default: Release
+      target:
+        description: Which platform to build for
+        required: true
+        type: choice
+        options:
+          - device
+          - simulator
+          - both
+        default: both
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-test-build-${{ github.ref }}
+  group: ios-test-build-${{ github.ref }}-${{ inputs.target }}
   cancel-in-progress: true
 
 jobs:
   build:
     name: Build unsigned full ${{ inputs.configuration }} IPA
+    if: ${{ inputs.target == 'device' || inputs.target == 'both' }}
     runs-on: macos-26
     timeout-minutes: ${{ inputs.configuration == 'Release' && 120 || 30 }}
     env:
@@ -112,5 +122,105 @@ jobs:
         with:
           name: nuvio-test-${{ inputs.configuration }}-ipa-${{ github.sha }}
           path: build/ios-ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+  simulator:
+    name: Build unsigned Debug simulator app
+    if: ${{ inputs.target == 'simulator' || inputs.target == 'both' }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+      RELEASE_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+      CONTRIBUTIONS_URL: https://api.github.com/repos/luqmanfadlli/NuvioMobile-Enhanced/contributors?per_page=100
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+
+      - name: Configure runtime properties
+        if: env.RELEASE_PROPERTIES_BASE64 != ''
+        run: |
+          printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
+          sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
+          if [[ -n "${CONTRIBUTIONS_URL}" ]]; then
+            printf 'CONTRIBUTIONS_URL=%s\n' "${CONTRIBUTIONS_URL}" >> local.properties
+          fi
+
+      - name: Prepare iOS dependencies
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Build unsigned Debug simulator app
+        run: |
+          env \
+            NUVIO_IOS_DISTRIBUTION=full \
+            xcodebuild \
+            -project iosApp/iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/ios-derived-sim-debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            build
+
+      - name: Summarize simulator app
+        run: |
+          app_path="$(find build/ios-derived-sim-debug/Build/Products -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "${app_path}" ]]; then
+            echo "No simulator .app was produced." >&2
+            exit 1
+          fi
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_path}/Info.plist")"
+          architectures="$(xcrun lipo -archs "${app_path}/${executable}")"
+
+          {
+            echo "## Test Simulator App"
+            echo
+            echo "- App: $(basename "${app_path}")"
+            echo "- Architectures: ${architectures}"
+            echo "- Configuration: Debug"
+            echo "- Signing: unsigned"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Zip simulator app
+        run: |
+          app_path="$(find build/ios-derived-sim-debug/Build/Products -maxdepth 1 -type d -name '*.app' -print -quit)"
+          ditto -c -k --sequesterRsrc --keepParent "${app_path}" build/nuvio-test-sim-debug-${{ github.sha }}.zip
+
+      - name: Upload simulator app
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-test-sim-debug-app-${{ github.sha }}
+          path: build/nuvio-test-sim-debug-${{ github.sha }}.zip
           if-no-files-found: error
           retention-days: 7
