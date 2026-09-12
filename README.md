@@ -1,3 +1,7 @@
+> **Fork notice:** this repository is built as **Nuvio Enhanced P2P** — a variant of
+> [Nuvio Enhanced](https://github.com/luqmanfadlli/NuvioMobile-Enhanced) with torrent/P2P playback enabled by default
+> and an automatic upstream-sync release pipeline.
+
 <div align="center">
 
   <img src="https://nuvio.tv/assets/nuvio-app-logo-wordmark.webp" alt="Nuvio" width="320" />
