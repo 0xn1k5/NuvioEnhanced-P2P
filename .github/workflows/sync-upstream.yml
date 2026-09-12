@@ -1,0 +1,154 @@
+name: Sync Upstream and Publish
+run-name: Auto-sync ${{ inputs.upstream_repo || 'NuvioMedia/NuvioMobile' }}@${{ inputs.upstream_branch || 'cmp-rewrite' }}
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Upstream repository to track (owner/name)
+        required: false
+        type: string
+        default: NuvioMedia/NuvioMobile
+      upstream_branch:
+        description: Upstream branch to track
+        required: false
+        type: string
+        default: cmp-rewrite
+      auto_publish:
+        description: Publish the GitHub release (otherwise create a draft)
+        required: false
+        type: boolean
+        default: false
+      target:
+        description: Platforms to build after a successful sync
+        required: false
+        type: choice
+        options:
+          - all
+          - android-only
+          - ios-only
+        default: all
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ${{ inputs.upstream_branch || 'cmp-rewrite' }}
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      version: ${{ steps.merge.outputs.version }}
+      should_release: ${{ steps.merge.outputs.should_release }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out default branch with full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream branch
+        run: |
+          git fetch \
+            "https://github.com/${{ inputs.upstream_repo || 'NuvioMedia/NuvioMobile' }}.git" \
+            "${{ inputs.upstream_branch || 'cmp-rewrite' }}:refs/remotes/upstream/${{ inputs.upstream_branch || 'cmp-rewrite' }}"
+          git log -1 --oneline "refs/remotes/upstream/${{ inputs.upstream_branch || 'cmp-rewrite' }}"
+
+      - name: Merge upstream and prepare release
+        id: merge
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          upstream_ref="refs/remotes/upstream/${{ inputs.upstream_branch || 'cmp-rewrite' }}"
+          upstream_head="$(git rev-parse --verify "${upstream_ref}^{commit}")"
+
+          if git merge-base --is-ancestor "${upstream_head}" HEAD; then
+            echo "::notice::No new upstream commits on ${{ inputs.upstream_branch || 'cmp-rewrite' }} to merge."
+            echo "merged=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "::notice::Merging $(( $(git rev-list --count "HEAD..${upstream_head}") )) new upstream commits."
+
+          if ! git merge --no-edit "${upstream_ref}" > "${RUNNER_TEMP}/merge.log" 2>&1; then
+            if git status --porcelain | grep -Eq '^(UU|AA|DD|AU|UA|DU|UD)'; then
+              conflicts="$(
+                git status --porcelain \
+                  | grep -E '^(UU|AA|DD|AU|UA|DU|UD)' \
+                  | cut -c4- || true
+              )"
+              git merge --abort
+              echo "::error::Merge conflict while syncing ${{ inputs.upstream_branch || 'cmp-rewrite' }}. Aborted and opened an issue."
+              {
+                printf 'The automated merge of \`%s@%s\` into \`%s\` conflicted and was aborted.\n\n' \
+                  "${{ inputs.upstream_repo || 'NuvioMedia/NuvioMobile' }}" "${{ inputs.upstream_branch || 'cmp-rewrite' }}" "${GITHUB_REF_NAME}"
+                printf 'Conflicting paths:\n\n\`\`\`\n%s\n\`\`\`\n\n' "${conflicts}"
+                printf 'Resolve manually:\n\n\`\`\`bash\ngit checkout %s\ngit switch -c sync/%s\n' \
+                  "${GITHUB_REF_NAME}" "${GITHUB_REF_NAME}"
+                printf 'git fetch https://github.com/%s.git %s\ngit merge %s\n' \
+                  "${{ inputs.upstream_repo || 'NuvioMedia/NuvioMobile' }}" "${{ inputs.upstream_branch || 'cmp-rewrite' }}" "${{ inputs.upstream_branch || 'cmp-rewrite' }}"
+                printf '# resolve conflicts, then: git push origin sync/%s\n\`\`\`\n' "${GITHUB_REF_NAME}"
+              } > "${RUNNER_TEMP}/sync-conflict-body.md"
+              gh issue create \
+                --title "Upstream sync conflict: ${{ inputs.upstream_repo || 'NuvioMedia/NuvioMobile' }}@${{ inputs.upstream_branch || 'cmp-rewrite' }}" \
+                --body-file "${RUNNER_TEMP}/sync-conflict-body.md"
+              exit 1
+            fi
+            echo "::error::Merge failed without conflicts."
+            cat "${RUNNER_TEMP}/merge.log" >&2
+            exit 1
+          fi
+
+          version="$(sed -nE 's/^[[:space:]]*MARKETING_VERSION[[:space:]]*=[[:space:]]*([^[:space:]#]+).*$/\1/p' \
+            iosApp/Configuration/Version.xcconfig | head -n 1)"
+          [[ -n "${version}" ]] || { echo "::error::MARKETING_VERSION not found after the merge."; exit 1; }
+
+          echo "merged=true" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+          if gh release view "${version}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::notice::Version ${version} is already released; syncing source only."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+          else
+            current_build="$(sed -nE 's/^[[:space:]]*CURRENT_PROJECT_VERSION[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' \
+              iosApp/Configuration/Version.xcconfig | head -n 1)"
+            printf 'CURRENT_PROJECT_VERSION=%s\nMARKETING_VERSION=%s\n' "$(( current_build + 1 ))" "${version}" \
+              > iosApp/Configuration/Version.xcconfig
+            git add iosApp/Configuration/Version.xcconfig
+            git commit -m "bump version"
+            echo "::notice::Version bump commit created (build ${current_build} -> $(( current_build + 1 )), version ${version})."
+            echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Push synced branch
+        if: steps.merge.outputs.merged == 'true'
+        run: git push origin "${GITHUB_REF_NAME}"
+
+  release:
+    name: Queue release build for v${{ needs.sync.outputs.version }}
+    runs-on: ubuntu-latest
+    needs: sync
+    if: needs.sync.outputs.merged == 'true' && needs.sync.outputs.should_release == 'true'
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Dispatch Build Mobile Release
+        run: |
+          gh workflow run mobile-release.yml \
+            --ref "${GITHUB_REF_NAME}" \
+            -f mode="${{ inputs.auto_publish == true && 'publish' || 'draft' }}" \
+            -f target="${{ inputs.target || 'all' }}" \
+            -f description="auto-sync ${{ inputs.upstream_repo || 'NuvioMedia/NuvioMobile' }}@${{ inputs.upstream_branch || 'cmp-rewrite' }} (${{ needs.sync.outputs.version }})"
